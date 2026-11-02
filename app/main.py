@@ -1,3 +1,4 @@
+from fastapi.middleware.cors import CORSMiddleware
 import base64
 import binascii
 import json
@@ -15,6 +16,15 @@ from common.aes_service import AesService
 app = FastAPI(
     title="Lab 6 Secure Communication API",
     version="1.0.0"
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173"
+    ],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "x-rsa-id", "x-session-id"],
 )
 
 rsa_service = RsaService()
@@ -161,3 +171,5 @@ def send_message(
 
     except (InvalidTag, ValueError, TypeError, KeyError, binascii.Error):
         raise HTTPException(400, "Invalid encrypted message")
+
+
