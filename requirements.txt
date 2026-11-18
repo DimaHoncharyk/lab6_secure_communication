@@ -4,3 +4,6 @@ cryptography
 requests
 pytest
 httpx
+PyJWT[crypto]
+httpx
+python-dotenv

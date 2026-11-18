@@ -1,6 +1,8 @@
-
 import { useState } from "react";
 import "./App.css";
+import keycloak from "./keycloak";
+import HttpMonitor from "./HttpMonitor.jsx";
+import { addHttpRequest } from "./httpMonitor.js";
 
 const API = "";
 const encoder = new TextEncoder();
@@ -15,19 +17,73 @@ function toBase64(bytes) {
 }
 
 function fromBase64(value) {
-  return Uint8Array.from(atob(value), (c) => c.charCodeAt(0));
+  return Uint8Array.from(
+    atob(value),
+    (c) => c.charCodeAt(0)
+  );
 }
+
+
 
 async function apiRequest(path, options = {}) {
-  const response = await fetch(`${API}${path}`, options);
+  const method = (options.method || "GET").toUpperCase();
+  const startedAt = performance.now();
 
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`HTTP ${response.status}: ${error}`);
+  let status = null;
+
+  try {
+    try {
+      await keycloak.updateToken(30);
+    } catch {
+      throw new Error(
+        "Session authentication expired. Please sign in again."
+      );
+    }
+
+    if (!keycloak.token) {
+      throw new Error("Authentication required");
+    }
+
+    const response = await fetch(`${API}${path}`, {
+      ...options,
+      headers: {
+        ...options.headers,
+        Authorization: `Bearer ${keycloak.token}`
+      }
+    });
+
+    status = response.status;
+
+    if (!response.ok) {
+      const error = await response.text();
+
+      const exception = new Error(
+        `HTTP ${response.status}: ${error}`
+      );
+
+      exception.status = response.status;
+
+      throw exception;
+    }
+
+    return await response.json();
+
+  } catch (error) {
+    throw error;
+
+  } finally {
+    addHttpRequest({
+      method,
+      url: path,
+      status: status ?? "NETWORK ERROR",
+      duration: Math.round(
+        performance.now() - startedAt
+      )
+    });
   }
-
-  return response.json();
 }
+
+
 
 async function establishSession() {
   const { id } = await apiRequest(
@@ -63,7 +119,9 @@ async function establishSession() {
     session_id: sessionId,
     aes_key: {
       key: toBase64(rawKey),
-      iv: toBase64(crypto.getRandomValues(new Uint8Array(12)))
+      iv: toBase64(
+        crypto.getRandomValues(new Uint8Array(12))
+      )
     }
   });
 
@@ -73,42 +131,76 @@ async function establishSession() {
     encoder.encode(sessionData)
   );
 
-  await apiRequest("/api/sessions/init", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-rsa-id": String(id)
-    },
-    body: JSON.stringify({
-      encrypted_data: toBase64(new Uint8Array(encryptedSession))
-    })
-  });
+  const sessionResponse = await apiRequest(
+    "/api/sessions/init",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-rsa-id": String(id)
+      },
+      body: JSON.stringify({
+        encrypted_data: toBase64(
+          new Uint8Array(encryptedSession)
+        )
+      })
+    }
+  );
 
-  return { sessionId, rsaId: id, aesKey };
+  return {
+    sessionId,
+    rsaId: id,
+    aesKey,
+    createdAt: sessionResponse.created_at,
+    expiredAt: sessionResponse.expired_at
+  };
 }
 
 async function sendEncryptedMessage(session, message) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const iv = crypto.getRandomValues(
+    new Uint8Array(12)
+  );
+
+  const hashBuffer = await crypto.subtle.digest(
+    "SHA-256",
+    encoder.encode(message)
+  );
+
+  const messageHash = Array.from(
+    new Uint8Array(hashBuffer)
+  )
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+
+  const payload = JSON.stringify({
+    message: message,
+    hash: messageHash
+  });
 
   const encrypted = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
     session.aesKey,
-    encoder.encode(message)
+    encoder.encode(payload)
   );
 
-  const encryptedText = toBase64(new Uint8Array(encrypted));
+  const encryptedText = toBase64(
+    new Uint8Array(encrypted)
+  );
 
-  const response = await apiRequest("/api/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-session-id": session.sessionId
-    },
-    body: JSON.stringify({
-      iv: toBase64(iv),
-      encrypted_message: encryptedText
-    })
-  });
+  const response = await apiRequest(
+    "/api/messages",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-session-id": session.sessionId
+      },
+      body: JSON.stringify({
+        iv: toBase64(iv),
+        encrypted_message: encryptedText
+      })
+    }
+  );
 
   if (response.session_id !== session.sessionId) {
     throw new Error("Session ID mismatch");
@@ -130,26 +222,36 @@ async function sendEncryptedMessage(session, message) {
   };
 }
 
-export default function App() {
+export default function App({ keycloak }) {
+  const userName =
+  keycloak.idTokenParsed?.name ||
+  keycloak.idTokenParsed?.preferred_username ||
+  "User";
   const [session, setSession] = useState(null);
   const [status, setStatus] = useState("disconnected");
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [showEncrypted, setShowEncrypted] = useState(true);
 
   async function connect() {
+    if (busy) return;
+
     setBusy(true);
     setError("");
+    setNotice("");
     setStatus("connecting");
     setSession(null);
     setMessages([]);
 
     try {
       const newSession = await establishSession();
+
       setSession(newSession);
       setStatus("connected");
+      setNotice("Secure session established successfully.");
     } catch (err) {
       setStatus("disconnected");
       setError(err.message);
@@ -160,15 +262,49 @@ export default function App() {
 
   async function handleSend(event) {
     event.preventDefault();
+
     if (!session || !input.trim() || busy) return;
 
     const message = input.trim();
+
     setInput("");
     setBusy(true);
     setError("");
+    setNotice("");
 
     try {
-      const result = await sendEncryptedMessage(session, message);
+      let activeSession = session;
+      let result;
+
+      try {
+        result = await sendEncryptedMessage(
+          activeSession,
+          message
+        );
+      } catch (err) {
+        if (err.status !== 440) {
+          throw err;
+        }
+
+        setStatus("connecting");
+        setNotice(
+          "Session expired. Establishing a new secure session..."
+        );
+
+        activeSession = await establishSession();
+
+        setSession(activeSession);
+        setStatus("connected");
+
+        result = await sendEncryptedMessage(
+          activeSession,
+          message
+        );
+
+        setNotice(
+          "Session automatically renewed. Message delivered."
+        );
+      }
 
       setMessages((previous) => [
         ...previous,
@@ -188,6 +324,13 @@ export default function App() {
     } catch (err) {
       setInput(message);
       setError(err.message);
+
+      if (err.status === 440) {
+        setStatus("disconnected");
+        setSession(null);
+      } else if (status === "connecting") {
+        setStatus("disconnected");
+      }
     } finally {
       setBusy(false);
     }
@@ -200,14 +343,18 @@ export default function App() {
           <span className="brand-icon">◆</span>
           <div>
             <h2>SecureChat</h2>
-            <small>LABORATORY №6</small>
+            <small>LABORATORY №8</small>
           </div>
         </div>
 
         <div className="sidebar-section">
-          <span className="section-label">CONNECTION STATUS</span>
+          <span className="section-label">
+            CONNECTION STATUS
+          </span>
+
           <div className={`connection-status ${status}`}>
             <span className="status-dot" />
+
             {status === "connected"
               ? "Secure connection"
               : status === "connecting"
@@ -217,34 +364,82 @@ export default function App() {
         </div>
 
         <div className="sidebar-section">
-          <span className="section-label">CRYPTOGRAPHY</span>
+          <span className="section-label">
+            CRYPTOGRAPHY
+          </span>
+
           <div className="info-card">
             <span>Key exchange</span>
             <strong>RSA-OAEP · 2048-bit</strong>
           </div>
+
           <div className="info-card">
             <span>Message encryption</span>
             <strong>AES-256-GCM</strong>
           </div>
+
           <div className="info-card">
             <span>RSA Key ID</span>
             <strong>{session?.rsaId ?? "—"}</strong>
           </div>
+
+          <div className="info-card">
+            <span>Session lifetime</span>
+            <strong>60 seconds</strong>
+          </div>
         </div>
 
         <div className="sidebar-section">
-          <span className="section-label">ACTIVE SESSION</span>
+          <span className="section-label">
+            ACTIVE SESSION
+          </span>
+
           <div className="session-id">
             {session?.sessionId ?? "No active session"}
           </div>
+
+          {session?.expiredAt && (
+            <div className="info-card" style={{ marginTop: 12 }}>
+              <span>Expires at</span>
+              <strong>
+                {new Date(
+                  session.expiredAt
+                ).toLocaleTimeString()}
+              </strong>
+            </div>
+          )}
         </div>
+
+<div className="sidebar-section">
+  <span className="section-label">
+    AUTHENTICATED USER
+  </span>
+
+  <div className="info-card">
+    <span>Signed in as</span>
+    <strong>{userName}</strong>
+  </div>
+
+  <button
+    className="connect-button"
+    onClick={() =>
+      keycloak.logout({
+        redirectUri: window.location.origin + "/"
+      })
+    }
+  >
+    Вийти
+  </button>
+</div>
 
         <button
           className="connect-button"
           onClick={connect}
           disabled={busy}
         >
-          {status === "connected" ? "↻ New session" : "🔒 Connect"}
+          {status === "connected"
+            ? "↻ New session"
+            : "🔒 Connect"}
         </button>
 
         <p className="sidebar-footer">
@@ -259,18 +454,24 @@ export default function App() {
             <h1>Encrypted Communication</h1>
             <p>Secure client-server messaging</p>
           </div>
-          <span className="header-badge">RSA + AES</span>
+
+          <span className="header-badge">
+            RSA + AES
+          </span>
         </header>
 
         <div className="chat-area">
           {messages.length === 0 && (
             <div className="empty-state">
               <div className="empty-icon">🔐</div>
+
               <h2>Welcome to SecureChat</h2>
+
               <p>
                 Establish an encrypted session to start
                 exchanging messages with the server.
               </p>
+
               <button
                 onClick={connect}
                 disabled={busy}
@@ -289,10 +490,16 @@ export default function App() {
               className={`message ${message.type}`}
             >
               <div className="message-label">
-                {message.type === "user" ? "YOU" : "SECURE SERVER"}
+                {message.type === "user"
+                  ? "YOU"
+                  : "SECURE SERVER"}
               </div>
+
               <div className="message-bubble">
-                <div className="message-text">{message.text}</div>
+                <div className="message-text">
+                  {message.text}
+                </div>
+
                 {showEncrypted && (
                   <div className="encrypted-preview">
                     <span>ENCRYPTED PAYLOAD</span>
@@ -303,20 +510,41 @@ export default function App() {
             </div>
           ))}
         </div>
-
+        <HttpMonitor />
         <div className="chat-bottom">
-          {error && <div className="error-message">⚠ {error}</div>}
+          {error && (
+            <div className="error-message">
+              ⚠ {error}
+            </div>
+          )}
+
+          {notice && (
+            <div
+              style={{
+                color: "#22c55e",
+                marginBottom: 12,
+                fontSize: 13
+              }}
+            >
+              ✓ {notice}
+            </div>
+          )}
 
           <label className="display-option">
             <input
               type="checkbox"
               checked={showEncrypted}
-              onChange={(e) => setShowEncrypted(e.target.checked)}
+              onChange={(e) =>
+                setShowEncrypted(e.target.checked)
+              }
             />
             Show encrypted data
           </label>
 
-          <form className="message-form" onSubmit={handleSend}>
+          <form
+            className="message-form"
+            onSubmit={handleSend}
+          >
             <input
               type="text"
               placeholder={
@@ -328,13 +556,22 @@ export default function App() {
               onChange={(e) => setInput(e.target.value)}
               disabled={!session || busy}
             />
-            <button type="submit" disabled={!session || busy || !input.trim()}>
+
+            <button
+              type="submit"
+              disabled={
+                !session ||
+                busy ||
+                !input.trim()
+              }
+            >
               {busy ? "Sending..." : "Send →"}
             </button>
           </form>
 
           <div className="security-note">
-            🔒 Messages are encrypted in the browser before transmission.
+            🔒 Messages are encrypted in the browser
+            before transmission.
           </div>
         </div>
       </main>

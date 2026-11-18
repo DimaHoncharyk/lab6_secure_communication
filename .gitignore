@@ -1,7 +1,21 @@
+# Python
 .venv/
-.idea/
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# PyCharm
+.idea/
+
+# Environment variables and secrets
 .env
+.env.*
+!.env.example
+
+# React / Node.js
+node_modules/
+dist/
+
+# macOS
 .DS_Store
+
